@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { execSync, spawn } from "node:child_process";
 
 /* ────────────────────────────────
    Paths & Config
@@ -22,6 +23,10 @@ interface ThetisConfig {
   serpApiKey?: string;
   cacheTtlMinutes?: number;
   maxScrapeLength?: number;
+  azureSpeechKey?: string;
+  azureSpeechRegion?: string;
+  sttProvider?: "auto" | "whisper-local" | "azure";
+  whisperModel?: "tiny" | "base" | "small" | "medium" | "large" | "turbo";
 }
 
 function loadConfig(): ThetisConfig {
@@ -94,6 +99,214 @@ function setCacheEntry(key: string, entry: CacheEntry): void {
     "utf8"
   );
 }
+
+/* ────────────────────────────────
+   Audio / STT helpers
+   ──────────────────────────────── */
+
+/* ────────────────────────────────
+   Whisper local detection & helpers
+   ──────────────────────────────── */
+
+let whisperDetected: boolean | null = null;
+
+function detectWhisper(): boolean {
+  if (whisperDetected !== null) return whisperDetected;
+  try {
+    execSync("whisper --help", { stdio: "ignore" });
+    whisperDetected = true;
+    return true;
+  } catch {
+    try {
+      execSync("python3 -m whisper --help", { stdio: "ignore" });
+      whisperDetected = true;
+      return true;
+    } catch {
+      whisperDetected = false;
+      return false;
+    }
+  }
+}
+
+function detectAudioMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const map: Record<string, string> = {
+    ".wav": "audio/wav",
+    ".wave": "audio/wav",
+    ".mp3": "audio/mp3",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".webm": "audio/webm",
+    ".weba": "audio/webm",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+  };
+  return map[ext] ?? "audio/wav";
+}
+
+async function transcribeWithWhisper(
+  filePath: string,
+  language?: string,
+  model?: string,
+  signal?: AbortSignal
+): Promise<string> {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Audio file not found: ${filePath}`);
+  }
+
+  const whisperCmd = (() => {
+    try {
+      execSync("whisper --help", { stdio: "ignore" });
+      return "whisper";
+    } catch {
+      return "python3 -m whisper";
+    }
+  })();
+
+  const lang = language && language !== "auto" ? language : "French";
+  const whisperModel = model ?? config.whisperModel ?? "base";
+  const outDir = path.join(EXT_DIR, "whisper_out");
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+  // Whisper writes .txt next to the audio by default; we force --output_dir
+  const args = [
+    filePath,
+    "--model", whisperModel,
+    "--language", lang,
+    "--output_dir", outDir,
+    "--output_format", "txt",
+    "--fp16", "False",
+  ];
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(whisperCmd.split(" ")[0], [...whisperCmd.split(" ").slice(1), ...args], {
+      cwd: EXT_DIR,
+      shell: whisperCmd.includes("python3") ? false : true,
+    });
+
+    let stderr = "";
+    proc.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+
+    proc.on("error", (err) => {
+      reject(new Error(`Failed to run Whisper: ${err.message}. Install with: pip install openai-whisper`));
+    });
+
+    proc.on("close", (code) => {
+      if (signal?.aborted) {
+        reject(new Error("Transcription cancelled by user."));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`Whisper exited with code ${code}. stderr: ${stderr.slice(0, 500)}`));
+        return;
+      }
+      // Whisper outputs basename.txt in outDir
+      const base = path.basename(filePath, path.extname(filePath));
+      const txtPath = path.join(outDir, `${base}.txt`);
+      if (!fs.existsSync(txtPath)) {
+        reject(new Error("Whisper did not produce output file."));
+        return;
+      }
+      const text = fs.readFileSync(txtPath, "utf8").trim();
+      // Cleanup
+      try { fs.unlinkSync(txtPath); } catch {}
+      resolve(text);
+    });
+  });
+}
+
+async function transcribeWithAzure(
+  filePath: string,
+  language?: string,
+  signal?: AbortSignal
+): Promise<string> {
+  const key = config.azureSpeechKey ?? process.env.AZURE_SPEECH_KEY;
+  const region = config.azureSpeechRegion ?? process.env.AZURE_SPEECH_REGION;
+  if (!key || !region) {
+    throw new Error(
+      "Azure Speech credentials not configured. Set them via /thetis config or the /thetis azure-key command."
+    );
+  }
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Audio file not found: ${filePath}`);
+  }
+
+  const mime = detectAudioMimeType(filePath);
+  const lang = language && language !== "auto" ? language : "fr-FR";
+  const url =
+    `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?` +
+    `language=${encodeURIComponent(lang)}&format=simple&profanity=mask`;
+
+  const audioBuffer = fs.readFileSync(filePath);
+
+  if (signal?.aborted) throw new Error("Transcription cancelled by user.");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Ocp-Apim-Subscription-Key": key,
+      "Content-Type": mime,
+    },
+    body: audioBuffer,
+    signal,
+  });
+
+  if (signal?.aborted) throw new Error("Transcription cancelled by user.");
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Azure Speech error ${res.status}: ${text.slice(0, 500)}`);
+  }
+
+  const data = (await res.json()) as {
+    RecognitionStatus?: string;
+    DisplayText?: string;
+  };
+
+  if (data.RecognitionStatus !== "Success") {
+    throw new Error(
+      `Azure Speech recognition failed: ${data.RecognitionStatus ?? "Unknown error"}`
+    );
+  }
+
+  return data.DisplayText ?? "";
+}
+
+function resolveSttProvider(requested?: "auto" | "whisper-local" | "azure"): "whisper-local" | "azure" {
+  const req = requested ?? config.sttProvider ?? "auto";
+  if (req === "whisper-local") {
+    if (!detectWhisper()) {
+      throw new Error(
+        "Whisper-local requested but not installed. Run: pip install openai-whisper"
+      );
+    }
+    return "whisper-local";
+  }
+  if (req === "azure") {
+    const key = config.azureSpeechKey ?? process.env.AZURE_SPEECH_KEY;
+    const region = config.azureSpeechRegion ?? process.env.AZURE_SPEECH_REGION;
+    if (!key || !region) {
+      throw new Error(
+        "Azure requested but credentials missing. Set via /thetis azure-key or /thetis config."
+      );
+    }
+    return "azure";
+  }
+  // auto
+  if (detectWhisper()) return "whisper-local";
+  const key = config.azureSpeechKey ?? process.env.AZURE_SPEECH_KEY;
+  const region = config.azureSpeechRegion ?? process.env.AZURE_SPEECH_REGION;
+  if (key && region) return "azure";
+  throw new Error(
+    "No STT provider available. Install Whisper (pip install openai-whisper) or configure Azure Speech via /thetis azure-key."
+  );
+}
+
+/* ────────────────────────────────
+   Cache helpers (suite)
+   ──────────────────────────────── */
 
 function clearCache(): { deleted: number } {
   ensureCacheDir();
@@ -622,6 +835,70 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
     },
   });
 
+  /* ─── Tool: speech_to_text ─── */
+  pi.registerTool({
+    name: "speech_to_text",
+    label: "Speech to Text",
+    description:
+      "Transcribe an audio file to text. Supports Whisper local (free, offline) and Azure Speech Services (cloud, free tier 5h/month). Auto-detects the best available provider.",
+    promptSnippet: "Transcribe an audio file to text",
+    promptGuidelines: [
+      "Use speech_to_text when the user provides or mentions an audio file that needs to be transcribed.",
+      "Supports audio from WhatsApp (.ogg), Discord (.mp3, .wav, .webm), and other common formats.",
+      "Default provider is 'auto': prefers Whisper local if installed, otherwise falls back to Azure Speech.",
+      "For Whisper local: install with 'pip install openai-whisper' and ensure ffmpeg is available.",
+      "For Azure: configure key via /thetis azure-key. The F0 tier is free for up to 5 hours of audio per month.",
+      "Default language is fr-FR; override with the language parameter if the audio is in another language (e.g. 'en-US').",
+    ],
+    parameters: Type.Object({
+      filePath: Type.String({ description: "Absolute path to the audio file" }),
+      language: Type.Optional(
+        Type.String({
+          description:
+            "Language code (default: fr-FR). Examples: en-US, es-ES, de-DE. Use 'auto' for fr-FR fallback.",
+        })
+      ),
+      provider: Type.Optional(
+        StringEnum(["auto", "whisper-local", "azure"] as const, {
+          description: "STT provider (default: auto — tries whisper-local first, then azure)",
+        })
+      ),
+      model: Type.Optional(
+        StringEnum(["tiny", "base", "small", "medium", "large", "turbo"] as const, {
+          description: "Whisper model size (default: base). Only used with whisper-local.",
+        })
+      ),
+    }),
+
+    async execute(_toolCallId, params, signal) {
+      const provider = resolveSttProvider(params.provider);
+      let text: string;
+      if (provider === "whisper-local") {
+        text = await transcribeWithWhisper(
+          params.filePath,
+          params.language,
+          params.model,
+          signal
+        );
+      } else {
+        text = await transcribeWithAzure(
+          params.filePath,
+          params.language,
+          signal
+        );
+      }
+      return {
+        content: [{ type: "text", text: text || "(no speech detected)" }],
+        details: {
+          filePath: params.filePath,
+          language: params.language ?? "fr-FR",
+          provider,
+          model: provider === "whisper-local" ? (params.model ?? config.whisperModel ?? "base") : undefined,
+        },
+      };
+    },
+  });
+
   /* ─── Command: /thetis ─── */
   pi.registerCommand("thetis", {
     description: "Manage Thetis tools (status, cache, config)",
@@ -632,6 +909,22 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
       if (sub === "clear-cache" || sub === "clear") {
         const { deleted } = clearCache();
         ctx.ui.notify(`Cleared ${deleted} cached item(s).`, "info");
+        return;
+      }
+
+      if (sub === "azure-key") {
+        const key = parts[1];
+        if (!key) {
+          ctx.ui.notify("Usage: /thetis azure-key <your-azure-speech-key>", "warning");
+          return;
+        }
+        const newCfg: ThetisConfig = {
+          ...config,
+          azureSpeechKey: key.trim(),
+        };
+        saveConfig(newCfg);
+        config = newCfg;
+        ctx.ui.notify("Azure Speech key saved.", "success");
         return;
       }
 
@@ -656,12 +949,32 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
           `Default max scrape length [${config.maxScrapeLength ?? 15000}]:`,
           String(config.maxScrapeLength ?? 15000)
         );
+        const azureKey = await ctx.ui.input(
+          "Azure Speech key (leave empty to keep current / disable Azure STT):",
+          config.azureSpeechKey ?? ""
+        );
+        const azureRegion = await ctx.ui.input(
+          `Azure Speech region [${config.azureSpeechRegion ?? "westeurope"}]:`,
+          config.azureSpeechRegion ?? "westeurope"
+        );
+        const sttProvider = await ctx.ui.input(
+          `STT provider [${config.sttProvider ?? "auto"}] (auto / whisper-local / azure):`,
+          config.sttProvider ?? "auto"
+        );
+        const whisperModel = await ctx.ui.input(
+          `Whisper model [${config.whisperModel ?? "base"}] (tiny / base / small / medium / large / turbo):`,
+          config.whisperModel ?? "base"
+        );
 
         const newCfg: ThetisConfig = {
           ...config,
           serpApiKey: key.trim() || undefined,
           cacheTtlMinutes: parseInt(ttlRaw.trim(), 10) || 60,
           maxScrapeLength: parseInt(maxLenRaw.trim(), 10) || 15000,
+          azureSpeechKey: azureKey.trim() || undefined,
+          azureSpeechRegion: azureRegion.trim() || undefined,
+          sttProvider: (sttProvider.trim() as ThetisConfig["sttProvider"]) || "auto",
+          whisperModel: (whisperModel.trim() as ThetisConfig["whisperModel"]) || "base",
         };
         saveConfig(newCfg);
         config = newCfg;
@@ -681,11 +994,15 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
         ``,
         `Cache : ${cacheText}`,
         `SerpAPI key : ${config.serpApiKey ? "✅ configured" : "❌ not set (web_search disabled)"}`,
+        `Azure Speech : ${config.azureSpeechKey && config.azureSpeechRegion ? "✅ configured" : "❌ not set (speech_to_text disabled)"}`,
+        `Whisper local : ${detectWhisper() ? "✅ installed" : "❌ not installed"}`,
+        `STT provider : ${config.sttProvider ?? "auto"}`,
+        `Whisper model : ${config.whisperModel ?? "base"}`,
         `Cache TTL : ${config.cacheTtlMinutes ?? 60} min`,
         `Max length : ${config.maxScrapeLength ?? 15000} chars`,
         ``,
-        `Tools registered : web_scrape, web_search, web_render`,
-        `Commands : /thetis status, /thetis clear-cache, /thetis config`,
+        `Tools registered : web_scrape, web_search, web_render, speech_to_text`,
+        `Commands : /thetis status, /thetis clear-cache, /thetis config, /thetis azure-key`,
       ].join("\n");
 
       ctx.ui.notify(statusText, "info");

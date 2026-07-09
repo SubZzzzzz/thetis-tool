@@ -1,10 +1,11 @@
 # Thetis Tool Extension
 
-Extension **Pi Coding Agent** qui fournit 3 outils web pour l'agent :
+Extension **Pi Coding Agent** qui fournit 4 outils pour l'agent :
 
 - **`web_scrape`** — extraction statique de pages (HTML, texte, markdown, liens, readability)
 - **`web_search`** — recherche web via SerpAPI (Google, DuckDuckGo, Bing, Yahoo, Yandex)
 - **`web_render`** — rendu dynamique avec Playwright pour les SPA JS-heavy
+- **`speech_to_text`** — transcription vocale (Whisper local gratuit ou Azure Speech cloud)
 
 Avec système de **cache local**, **configuration persistante**, et **guidelines prompt** pour guider l'agent dans le choix des outils.
 
@@ -29,14 +30,6 @@ git clone https://github.com/SubZzzzzz/thetis-tool.git ~/.pi/agent/extensions/th
 cd ~/.pi/agent/extensions/thetis-tool
 npm install
 ```
-
-Pour activer `web_search`, configure une clé SerpAPI :
-
-```bash
-/thetis config
-```
-
-Ou définis la variable d'environnement `SERPAPI_KEY`.
 
 ## Outils
 
@@ -106,9 +99,46 @@ Rendu dynamique avec Playwright pour les pages JS-heavy. Fallback quand `web_scr
 - Nécessite Playwright installé (`npm install playwright` dans le dossier de l'extension)
 - Retourne `html` par défaut pour la consommation LLM ; utiliser `markdown` pour du texte simplifié
 
+### `speech_to_text`
+
+Transcription vocale multi-provider. Auto-détecte le meilleur provider disponible.
+
+**Providers :**
+
+- **`whisper-local`** (défaut si installé) — 100% gratuit, offline, via [OpenAI Whisper](https://github.com/openai/whisper) open source
+  - Installation : `pip install openai-whisper` + `ffmpeg` doit être dans le PATH
+  - Modèles disponibles : `tiny`, `base`, `small`, `medium`, `large`, `turbo`
+  - Rapide sur CPU moderne, qualité excellente
+- **`azure`** (fallback cloud) — [Azure Speech Services](https://azure.microsoft.com/services/cognitive-services/speech-services/), tier **F0 gratuit** (5 heures/mois)
+  - Nécessite une clé + région Azure
+  - Très rapide, excellent pour le français
+
+**Paramètres :**
+
+| Paramètre | Type | Défaut | Description |
+|-----------|------|--------|-------------|
+| `filePath` | `string` | — | Chemin absolu vers le fichier audio |
+| `language` | `string?` | `"fr-FR"` | Code langue (`fr-FR`, `en-US`, `es-ES`...) |
+| `provider` | `"auto" \| "whisper-local" \| "azure"` | `"auto"` | Provider STT |
+| `model` | `"tiny" \| "base" \| "small" \| "medium" \| "large" \| "turbo"` | `"base"` | Modèle Whisper (uniquement pour whisper-local) |
+
+**Formats supportés :**
+`.mp3`, `.wav`, `.ogg` (WhatsApp), `.webm` (Discord), `.m4a`, `.aac`, `.flac`
+
+**Logique `auto` :**
+1. Teste si Whisper local est installé → l'utilise
+2. Sinon teste si Azure est configuré → fallback Azure
+3. Sinon erreur explicative avec instructions d'installation
+
+**Guidelines prompt :**
+- Utiliser `speech_to_text` quand l'utilisateur fournit ou mentionne un fichier audio à transcrire
+- WhatsApp envoie des `.ogg`, Discord des `.mp3`/`.wav`/`.webm`
+- Ne pas demander de provider : l'agent laisse `auto` par défaut
+- La langue par défaut est `fr-FR`
+
 ## Cache
 
-Un cache local est activé par défaut (TTL : 60 minutes) :
+Un cache local est activé par défaut (TTL : 60 minutes) pour les outils web uniquement :
 
 - Clés basées sur `url + extract + selector + renderJs`
 - Réduction des appels réseau répétés
@@ -119,23 +149,36 @@ Un cache local est activé par défaut (TTL : 60 minutes) :
 
 ### `/thetis status`
 
-Affiche l'état du cache et de la configuration :
-- Nombre de fichiers en cache et taille totale
-- État de la clé SerpAPI
-- TTL et max length configurés
+Affiche l'état complet :
+- Cache : fichiers et taille
+- SerpAPI : configuré ou non
+- Azure Speech : configuré ou non
+- Whisper local : installé ou non
+- STT provider et modèle actifs
+- TTL et max length
 
 ### `/thetis clear-cache`
 
 Vide immédiatement le cache local.
 
+### `/thetis azure-key <key>`
+
+Commande rapide pour enregistrer la clé Azure Speech sans passer par le wizard complet.
+
+```bash
+/thetis azure-key your-azure-speech-key-here
+```
+
 ### `/thetis config`
 
-Wizard interactif de configuration :
+Wizard interactif de configuration complète :
 - Clé SerpAPI
 - TTL du cache (minutes)
 - Longueur max de scrape (caractères)
-
-La config est sauvegardée dans `~/.pi/agent/extensions/thetis-tool/config.json`.
+- **Clé Azure Speech**
+- **Région Azure Speech** (défaut : `westeurope`)
+- **Provider STT** (`auto` / `whisper-local` / `azure`)
+- **Modèle Whisper** (`tiny` / `base` / `small` / `medium` / `large` / `turbo`)
 
 ## Configuration
 
@@ -145,12 +188,18 @@ Fichier `~/.pi/agent/extensions/thetis-tool/config.json` :
 {
   "serpApiKey": "...",
   "cacheTtlMinutes": 60,
-  "maxScrapeLength": 15000
+  "maxScrapeLength": 15000,
+  "azureSpeechKey": "...",
+  "azureSpeechRegion": "westeurope",
+  "sttProvider": "auto",
+  "whisperModel": "base"
 }
 ```
 
 Variables d'environnement :
 - `SERPAPI_KEY` — clé API SerpAPI (prioritaire sur le fichier de config)
+- `AZURE_SPEECH_KEY` — clé Azure Speech (prioritaire sur le fichier)
+- `AZURE_SPEECH_REGION` — région Azure (prioritaire sur le fichier)
 
 ## Stack
 
@@ -160,6 +209,8 @@ Variables d'environnement :
 - Turndown (HTML → Markdown)
 - @mozilla/readability (extraction article)
 - SerpAPI (recherche web)
+- OpenAI Whisper (STT local, optionnel)
+- Azure Speech Services (STT cloud, optionnel)
 
 ## Dépendances
 
@@ -177,6 +228,10 @@ Peer dependencies :
 - `@earendil-works/pi-coding-agent`
 - `@earendil-works/pi-ai`
 - `typebox`
+
+**Dépendances optionnelles (externes) :**
+- `openai-whisper` — `pip install openai-whisper` pour le STT local
+- `ffmpeg` — doit être dans le PATH (requis par Whisper)
 
 ## Fichiers
 
