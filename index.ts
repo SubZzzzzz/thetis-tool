@@ -5,6 +5,13 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import {
+  Container,
+  DynamicBorder,
+  SelectList,
+  Spacer,
+  Text,
+} from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
@@ -27,6 +34,202 @@ interface ThetisConfig {
   azureSpeechRegion?: string;
   sttProvider?: "auto" | "whisper-local" | "azure";
   whisperModel?: "tiny" | "base" | "small" | "medium" | "large" | "turbo";
+}
+
+/* ────────────────────────────────
+   Sensitive Action Confirmation
+   ──────────────────────────────── */
+
+const CONFIRM_PATH = path.join(EXT_DIR, "confirm.json");
+
+interface ConfirmConfig {
+  enabled: boolean;
+}
+
+function loadConfirmConfig(): ConfirmConfig {
+  if (!fs.existsSync(CONFIRM_PATH)) return { enabled: true };
+  try {
+    return JSON.parse(fs.readFileSync(CONFIRM_PATH, "utf8")) as ConfirmConfig;
+  } catch {
+    return { enabled: true };
+  }
+}
+
+function saveConfirmConfig(cfg: ConfirmConfig): void {
+  if (!fs.existsSync(EXT_DIR)) fs.mkdirSync(EXT_DIR, { recursive: true });
+  fs.writeFileSync(CONFIRM_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+}
+
+let confirmConfig: ConfirmConfig = loadConfirmConfig();
+
+/** Patterns for destructive bash commands */
+const DANGEROUS_BASH_PATTERNS = [
+  { regex: /\brm\s+(-[rf]*|--+recursive)/i, reason: "Recursive file deletion (rm)" },
+  { regex: /\bdd\s+/i, reason: "Low-level disk write (dd)" },
+  { regex: /\bmkfs\./i, reason: "Filesystem formatting (mkfs)" },
+  { regex: /\bsudo\b/i, reason: "Elevated privileges (sudo)" },
+  { regex: /\bchmod\b.*777/i, reason: "Dangerous permission change (chmod 777)" },
+  { regex: /\bchown\b.*root/i, reason: "Privilege escalation (chown root)" },
+  { regex: />\s*\/dev\/(sd|hd|nvme|mmcblk)/i, reason: "Direct disk overwrite" },
+  { regex: /\bcurl\b.*\|\s*(sh|bash|zsh)/i, reason: "Pipe from curl to shell (remote code execution)" },
+  { regex: /\bwget\b.*\|\s*(sh|bash|zsh)/i, reason: "Pipe from wget to shell (remote code execution)" },
+  { regex: /\bmv\s+.*\s+\/dev\/null/i, reason: "File sent to /dev/null" },
+  { regex: /\b>:?\s*\/dev\/(sd|hd|nvme|mmcblk)/i, reason: "Disk overwrite via redirection" },
+];
+
+/** Sensitive file paths for write/edit */
+const SENSITIVE_PATH_PATTERNS = [
+  /\.env/i,
+  /\.ssh\/id_/i,
+  /\.ssh\/authorized_keys/i,
+  /\.gnupg/i,
+  /\.aws\//i,
+  /\.config\/gh\/hosts\.yml/i,
+  /netrc/i,
+  /\.npmrc/i,
+  /\.pypirc/i,
+  /passwd/i,
+  /shadow/i,
+  /sudoers/i,
+  /\.git\/config/i,
+  /node_modules\//i,
+  /package-lock\.json$/i,
+  /yarn\.lock$/i,
+];
+
+function isSensitivePath(filePath: string): { sensitive: boolean; reason?: string } {
+  const normalized = path.normalize(filePath);
+  for (const p of SENSITIVE_PATH_PATTERNS) {
+    if (p.test(normalized)) {
+      return { sensitive: true, reason: `Protected path matched: ${normalized}` };
+    }
+  }
+  return { sensitive: false };
+}
+
+function isSensitiveAction(
+  toolName: string,
+  input: any
+): { sensitive: boolean; reason: string; details: string[] } {
+  const details: string[] = [];
+  let sensitive = false;
+  let reason = "";
+
+  switch (toolName) {
+    case "bash": {
+      const command: string = input.command ?? "";
+      for (const p of DANGEROUS_BASH_PATTERNS) {
+        if (p.regex.test(command)) {
+          sensitive = true;
+          reason = p.reason;
+          break;
+        }
+      }
+      details.push(`Command: ${command}`);
+      break;
+    }
+    case "write": {
+      const filePath: string = input.path ?? "";
+      const check = isSensitivePath(filePath);
+      if (check.sensitive) {
+        sensitive = true;
+        reason = check.reason!;
+      }
+      details.push(`File: ${filePath}`);
+      break;
+    }
+    case "edit": {
+      const filePath: string = input.path ?? "";
+      const check = isSensitivePath(filePath);
+      if (check.sensitive) {
+        sensitive = true;
+        reason = check.reason!;
+      }
+      details.push(`File: ${filePath}`);
+      break;
+    }
+    // Les outils Thetis réseau/API (web_search, web_render, web_scrape,
+    // speech_to_text) ne déclenchent PAS de wizard — seules les actions
+    // réellement destructives (bash, write, edit sur fichiers sensibles)
+    // sont protégées.
+  }
+
+  return { sensitive, reason, details };
+}
+
+async function confirmActionWizard(
+  ctx: ExtensionContext,
+  toolName: string,
+  reason: string,
+  details: string[]
+): Promise<boolean> {
+  if (!ctx.hasUI) return false;
+
+  // Mode TUI : wizard overlay riche avec détails
+  if (ctx.mode === "tui") {
+    const result = await ctx.ui.custom<"accept" | "reject" | null>(
+      (tui, theme, _kb, done) => {
+        const container = new Container();
+
+        container.addChild(new DynamicBorder((s: string) => theme.fg("warning", s)));
+        container.addChild(
+          new Text(theme.fg("warning", theme.bold(`⚠️  Action sensible détectée`)), 1, 0)
+        );
+        container.addChild(new Text(theme.fg("accent", `Outil : ${toolName}`), 1, 0));
+        container.addChild(new Spacer(1));
+        container.addChild(new Text(theme.fg("error", reason), 1, 0));
+        container.addChild(new Spacer(1));
+
+        for (const detail of details) {
+          container.addChild(new Text(theme.fg("muted", detail), 1, 0));
+        }
+        container.addChild(new Spacer(1));
+
+        const items = [
+          { value: "accept", label: "✅ Accepter", description: "Exécuter cette action" },
+          { value: "reject", label: "❌ Refuser", description: "Annuler cette action" },
+        ];
+
+        const selectList = new SelectList(items, 2, {
+          selectedPrefix: (t: string) => theme.fg("accent", t),
+          selectedText: (t: string) => theme.fg("accent", t),
+          description: (t: string) => theme.fg("muted", t),
+          scrollInfo: (t: string) => theme.fg("dim", t),
+          noMatch: (t: string) => theme.fg("warning", t),
+        });
+        selectList.onSelect = (item: any) => done(item.value as "accept" | "reject");
+        selectList.onCancel = () => done(null);
+        container.addChild(selectList);
+
+        container.addChild(
+          new Text(theme.fg("dim", "↑↓ naviguer • Entrée pour confirmer • Échap pour annuler"), 1, 0)
+        );
+        container.addChild(new DynamicBorder((s: string) => theme.fg("warning", s)));
+
+        return {
+          render: (w: number) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            selectList.handleInput(data);
+            tui.requestRender();
+          },
+        };
+      },
+      { overlay: true }
+    );
+    return result === "accept";
+  }
+
+  // Mode RPC / Gateway : select/confirm relayé au client distant
+  const title = `⚠️ ${toolName} — ${reason}`;
+  const body = details.length > 0 ? details.join("\n") : undefined;
+
+  // confirm() est supporté en RPC ; select() aussi
+  const ok = await ctx.ui.confirm(
+    title,
+    body ?? "Action sensible détectée. Autoriser l'exécution ?"
+  );
+  return ok;
 }
 
 function loadConfig(): ThetisConfig {
@@ -630,7 +833,31 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
   // Purge stale cache on every session start
   pi.on("session_start", async () => {
     config = loadConfig();
+    confirmConfig = loadConfirmConfig();
     purgeStaleCache();
+  });
+
+  /* ─── Permission gate for sensitive actions ─── */
+  pi.on("tool_call", async (event, ctx) => {
+    if (!confirmConfig.enabled) return;
+
+    const { sensitive, reason, details } = isSensitiveAction(
+      event.toolName,
+      event.input
+    );
+    if (!sensitive) return;
+
+    if (!ctx.hasUI) {
+      return {
+        block: true,
+        reason: `Action sensible bloquée (pas d'UI pour confirmation) : ${reason}`,
+      };
+    }
+
+    const ok = await confirmActionWizard(ctx, event.toolName, reason, details);
+    if (!ok) {
+      return { block: true, reason: "Action refusée par l'utilisateur" };
+    }
   });
 
   /* ─── Tool: web_scrape ─── */
@@ -912,6 +1139,17 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (sub === "confirm" || sub === "confirmation") {
+        const next = !confirmConfig.enabled;
+        confirmConfig = { enabled: next };
+        saveConfirmConfig(confirmConfig);
+        ctx.ui.notify(
+          `Confirmations d'actions sensibles : ${next ? "activées" : "désactivées"}.`,
+          "info"
+        );
+        return;
+      }
+
       if (sub === "azure-key") {
         const key = parts[1];
         if (!key) {
@@ -1002,7 +1240,8 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
         `Max length : ${config.maxScrapeLength ?? 15000} chars`,
         ``,
         `Tools registered : web_scrape, web_search, web_render, speech_to_text`,
-        `Commands : /thetis status, /thetis clear-cache, /thetis config, /thetis azure-key`,
+        `Confirmations sensibles (bash/write/edit) : ${confirmConfig.enabled ? "✅ activées" : "❌ désactivées"} (/thetis confirm)`,
+        `Commands : /thetis status, /thetis clear-cache, /thetis config, /thetis azure-key, /thetis confirm`,
       ].join("\n");
 
       ctx.ui.notify(statusText, "info");
