@@ -8,6 +8,20 @@ Extension **Pi Coding Agent** qui fournit 3 outils web :
 
 ## Installation
 
+### Via `pi install` (recommandé)
+
+```bash
+pi install git:github.com/SubZzzzzz/thetis-tool
+```
+
+Ou en local temporaire (sans persister dans les settings) :
+
+```bash
+pi -e git:github.com/SubZzzzzz/thetis-tool
+```
+
+### Manuel
+
 Copier ce dossier dans `~/.pi/agent/extensions/thetis-tool`, puis :
 
 ```bash
