@@ -3,7 +3,7 @@
 Extension **Pi Coding Agent** qui fournit 4 outils pour l'agent :
 
 - **`web_scrape`** — extraction statique de pages (HTML, texte, markdown, liens, readability)
-- **`web_search`** — recherche web via SerpAPI (Google, DuckDuckGo, Bing, Yahoo, Yandex)
+- **`web_search`** — recherche web via DuckDuckGo scraping (gratuit, sans clé API), avec Bing en fallback si DuckDuckGo bloque. SerpAPI pour Google, Yahoo et Yandex.
 - **`web_render`** — rendu dynamique avec Playwright pour les SPA JS-heavy
 - **`speech_to_text`** — transcription vocale (Whisper local gratuit ou Azure Speech cloud)
 
@@ -65,20 +65,20 @@ Extraction de contenu depuis une URL. Mode statique par défaut (rapide). Mode d
 
 ### `web_search`
 
-Recherche web via SerpAPI. Retourne titres, URLs et snippets.
+Recherche web. Retourne titres, URLs et snippets. Par défaut, tente DuckDuckGo (gratuit). Si DuckDuckGo bloque la requête (CAPTCHA), bascule automatiquement sur Bing. Pour Google, Yahoo ou Yandex, une clé SerpAPI est requise.
 
 **Paramètres :**
 
 | Paramètre | Type | Défaut | Description |
 |-----------|------|--------|-------------|
 | `query` | `string` | — | Requête de recherche |
-| `engine` | `"google" \| "duckduckgo" \| "bing" \| "yahoo" \| "yandex"` | `"google"` | Moteur de recherche |
+| `engine` | `"google" \| "duckduckgo" \| "bing" \| "yahoo" \| "yandex"` | `"duckduckgo"` | Moteur de recherche |
 | `numResults` | `number?` | `5` | Nombre de résultats (max 10) |
 
 **Guidelines prompt :**
 - Utiliser `web_search` quand l'utilisateur demande des informations actuelles, news, faits ou sources sans fournir d'URL
 - Suivre avec `web_scrape` pour lire le contenu complet des résultats les plus pertinents
-- Nécessite une clé SerpAPI configurée via `/thetis config` ou `SERPAPI_KEY`
+- Par défaut, utilise DuckDuckGo (gratuit) avec Bing en fallback automatique si bloqué. Pour Google/Yahoo/Yandex, configurer une clé SerpAPI via `/thetis config` ou `SERPAPI_KEY`
 
 ### `web_render`
 
@@ -151,7 +151,7 @@ Un cache local est activé par défaut (TTL : 60 minutes) pour les outils web un
 
 Affiche l'état complet :
 - Cache : fichiers et taille
-- SerpAPI : configuré ou non
+- SerpAPI : configuré ou non (optionnel, pour Google/Yahoo/Yandex)
 - Azure Speech : configuré ou non
 - Whisper local : installé ou non
 - STT provider et modèle actifs
@@ -208,7 +208,9 @@ Variables d'environnement :
 - Playwright (rendu dynamique)
 - Turndown (HTML → Markdown)
 - @mozilla/readability (extraction article)
-- SerpAPI (recherche web)
+- DuckDuckGo scraping (recherche web gratuite, préférée)
+- Bing scraping (fallback gratuit si DuckDuckGo bloque)
+- SerpAPI (recherche web premium pour Google/Yahoo/Yandex)
 - OpenAI Whisper (STT local, optionnel)
 - Azure Speech Services (STT cloud, optionnel)
 

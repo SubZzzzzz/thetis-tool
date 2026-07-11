@@ -19,6 +19,79 @@ import { createHash } from "node:crypto";
 import { execSync, spawn } from "node:child_process";
 
 /* ────────────────────────────────
+   pi-ai compatibility patch
+   ──────────────────────────────── */
+
+/**
+ * Patch pi-ai's anthropic-messages API to tolerate tools without parameters.
+ *
+ * MiniMax M3 via OpenCode Go uses the anthropic-messages API. pi-ai's
+ * convertTools() crashes with "Cannot read properties of undefined (reading
+ * 'properties')" when a tool has no parameters schema. This function patches
+ * the installed pi-ai file so the fix survives pi updates.
+ */
+function findPiAiAnthropicMessagesPath(): string | undefined {
+  // pi-ai is a dependency of pi-coding-agent, which is the process main script.
+  // Use process.argv[1] to locate pi-coding-agent's node_modules.
+  const mainScript = process.argv[1];
+  if (mainScript) {
+    try {
+      const resolvedMain = fs.realpathSync(mainScript);
+      let dir = path.dirname(resolvedMain);
+      // Walk up a few levels looking for pi-ai inside pi-coding-agent's tree.
+      for (let i = 0; i < 4; i++) {
+        const candidate = path.join(
+          dir,
+          "node_modules",
+          "@earendil-works",
+          "pi-ai",
+          "dist",
+          "api",
+          "anthropic-messages.js"
+        );
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    } catch {
+      // Ignore resolution errors and fall through.
+    }
+  }
+  return undefined;
+}
+
+function patchPiAiAnthropicMessages(): void {
+  try {
+    const filePath = findPiAiAnthropicMessagesPath();
+    if (!filePath) {
+      console.error(
+        "[thetis-tool] Could not locate pi-ai anthropic-messages.js"
+      );
+      return;
+    }
+    const content = fs.readFileSync(filePath, "utf8");
+    const buggyLine = "const schema = tool.parameters;";
+    if (!content.includes(buggyLine)) {
+      return;
+    }
+    const patched = content.replace(
+      buggyLine,
+      "const schema = tool.parameters ?? { type: \"object\", properties: {} };"
+    );
+    fs.writeFileSync(filePath, patched, "utf8");
+    console.log("[thetis-tool] Patched pi-ai anthropic-messages.js");
+  } catch (err) {
+    console.error(
+      "[thetis-tool] Failed to patch pi-ai anthropic-messages.js:",
+      err
+    );
+  }
+}
+
+/* ────────────────────────────────
    Paths & Config
    ──────────────────────────────── */
 
@@ -770,10 +843,10 @@ async function scrapeDynamic(
 }
 
 /* ────────────────────────────────
-   Web Search (SerpAPI)
+   Web Search (DuckDuckGo scraping + SerpAPI fallback)
    ──────────────────────────────── */
 
-async function webSearch(
+async function webSearchSerpAPI(
   query: string,
   engine: string,
   numResults: number,
@@ -825,11 +898,141 @@ async function webSearch(
   return lines.join("\n");
 }
 
+async function webSearchBing(
+  query: string,
+  numResults: number,
+  signal?: AbortSignal
+): Promise<string> {
+  const capped = Math.min(Math.max(1, numResults), 20);
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${capped}`;
+
+  checkSignal(signal);
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+    },
+    signal,
+  });
+  checkSignal(signal);
+  if (!res.ok) {
+    throw new Error(`Bing search error ${res.status}: ${res.statusText}`);
+  }
+  const html = await res.text();
+  const { load } = require("cheerio");
+  const $ = load(html);
+
+  const results: Array<{ title: string; link: string; snippet: string }> = [];
+  $(".b_algo").each((_: any, el: any) => {
+    const $el = $(el);
+    const title = $el.find("h2 a").text().trim();
+    let link = $el.find("h2 a").attr("href") ?? "";
+    // Decode Bing redirect URLs
+    if (link.includes("/ck/a?") && link.includes("u=")) {
+      try {
+        const u = new URL(link).searchParams.get("u");
+        if (u && u.startsWith("a1")) {
+          link = Buffer.from(u.slice(2), "base64").toString("utf8");
+        }
+      } catch {
+        /* keep original link */
+      }
+    }
+    const snippet = $el.find(".b_caption p").text().trim();
+    if (title && link) {
+      results.push({ title, link, snippet });
+    }
+  });
+
+  if (results.length === 0) {
+    return `No results found for "${query}".`;
+  }
+
+  const lines = [`Search: "${query}" (bing — free, no API key)`, ""];
+  for (let i = 0; i < Math.min(results.length, capped); i++) {
+    const r = results[i];
+    lines.push(
+      `${i + 1}. **${r.title}**\n   URL: ${r.link}\n   ${r.snippet || ""}`
+    );
+  }
+  return lines.join("\n");
+}
+
+async function webSearchDuckDuckGo(
+  query: string,
+  numResults: number,
+  signal?: AbortSignal
+): Promise<string> {
+  const capped = Math.min(Math.max(1, numResults), 20);
+  const url = "https://lite.duckduckgo.com/lite/";
+
+  checkSignal(signal);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: `q=${encodeURIComponent(query)}`,
+    signal,
+  });
+  checkSignal(signal);
+  if (!res.ok) {
+    throw new Error(`DuckDuckGo search error ${res.status}: ${res.statusText}`);
+  }
+  const html = await res.text();
+
+  // Detect CAPTCHA / anomaly block
+  if (html.includes("anomaly-modal") || html.includes("bots use DuckDuckGo")) {
+    throw new Error("DuckDuckGo blocked the request (CAPTCHA).");
+  }
+
+  const { load } = require("cheerio");
+  const $ = load(html);
+
+  const results: Array<{ title: string; link: string; snippet: string }> = [];
+  $("table tr").each((_: any, row: any) => {
+    const linkEl = $(row).find("a.result-link");
+    if (linkEl.length) {
+      const title = linkEl.text().trim();
+      const link = linkEl.attr("href") ?? "";
+      const snippetRow = $(row).next("tr");
+      const snippet = snippetRow.find("td.result-snippet").text().trim();
+      if (title && link) {
+        results.push({ title, link, snippet });
+      }
+    }
+  });
+
+  if (results.length === 0) {
+    throw new Error(`DuckDuckGo returned no results for "${query}".`);
+  }
+
+  const lines = [`Search: "${query}" (duckduckgo — free, no API key)`, ""];
+  for (let i = 0; i < Math.min(results.length, capped); i++) {
+    const r = results[i];
+    lines.push(
+      `${i + 1}. **${r.title}**\n   URL: ${r.link}\n   ${r.snippet || ""}`
+    );
+  }
+  return lines.join("\n");
+}
+
 /* ────────────────────────────────
    Extension factory
    ──────────────────────────────── */
 
 export default function thetisToolExtension(pi: ExtensionAPI) {
+  // Apply pi-ai compatibility patch on extension load.
+  patchPiAiAnthropicMessages();
+
   // Purge stale cache on every session start
   pi.on("session_start", async () => {
     config = loadConfig();
@@ -972,20 +1175,20 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web via SerpAPI and return a list of result titles, URLs, and snippets. Supports Google (default), DuckDuckGo, Bing, Yahoo, and Yandex.",
+      "Search the web and return a list of result titles, URLs, and snippets. DuckDuckGo scraping is used by default (free, no API key). For Google, Yahoo, or Yandex, a SerpAPI key is required.",
     promptSnippet:
       "Search the web for URLs and snippets on a topic",
     promptGuidelines: [
       "Use web_search when the user asks for current information, news, facts, or sources without providing a specific URL.",
       "Follow up with web_scrape to read the full content of the most relevant result(s).",
-      "Requires a SerpAPI key configured via /thetis config or the SERPAPI_KEY env variable.",
+      "Default engine is DuckDuckGo (free). For Google/Yahoo/Yandex, configure a SerpAPI key via /thetis config or the SERPAPI_KEY env variable.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
       engine: Type.Optional(
         StringEnum(
           ["google", "duckduckgo", "bing", "yahoo", "yandex"] as const,
-          { description: "Search engine (default: google)" }
+          { description: "Search engine (default: duckduckgo)" }
         )
       ),
       numResults: Type.Optional(
@@ -996,15 +1199,27 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal) {
-      const result = await webSearch(
-        params.query,
-        params.engine ?? "google",
-        params.numResults ?? 5,
-        signal
-      );
+      const engine = params.engine ?? "duckduckgo";
+      const numResults = params.numResults ?? 5;
+
+      let result: string;
+      if (engine === "duckduckgo") {
+        try {
+          result = await webSearchDuckDuckGo(params.query, numResults, signal);
+        } catch (ddgErr: any) {
+          // Fallback to Bing if DuckDuckGo blocks us
+          result = await webSearchBing(params.query, numResults, signal);
+          result = result.replace("(bing — free, no API key)", "(bing fallback — DuckDuckGo blocked)");
+        }
+      } else if (engine === "bing") {
+        result = await webSearchBing(params.query, numResults, signal);
+      } else {
+        result = await webSearchSerpAPI(params.query, engine, numResults, signal);
+      }
+
       return {
         content: [{ type: "text", text: result }],
-        details: { engine: params.engine ?? "google", query: params.query },
+        details: { engine, query: params.query },
       };
     },
   });
@@ -1176,7 +1391,7 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
           return;
         }
         const key = await ctx.ui.input(
-          "SerpAPI key (leave empty to keep current / disable search):",
+          "SerpAPI key (optional, for google/yahoo/yandex):",
           config.serpApiKey ?? ""
         );
         const ttlRaw = await ctx.ui.input(
@@ -1231,7 +1446,7 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
         `🔧 Thetis Tool Status`,
         ``,
         `Cache : ${cacheText}`,
-        `SerpAPI key : ${config.serpApiKey ? "✅ configured" : "❌ not set (web_search disabled)"}`,
+        `SerpAPI key : ${config.serpApiKey ? "✅ configured" : "❌ not set (duckduckgo + bing available)"}`,
         `Azure Speech : ${config.azureSpeechKey && config.azureSpeechRegion ? "✅ configured" : "❌ not set (speech_to_text disabled)"}`,
         `Whisper local : ${detectWhisper() ? "✅ installed" : "❌ not installed"}`,
         `STT provider : ${config.sttProvider ?? "auto"}`,
