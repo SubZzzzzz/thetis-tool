@@ -150,31 +150,76 @@ const DANGEROUS_BASH_PATTERNS = [
   { regex: /\b>:?\s*\/dev\/(sd|hd|nvme|mmcblk)/i, reason: "Disk overwrite via redirection" },
 ];
 
-/** Sensitive file paths for write/edit */
-const SENSITIVE_PATH_PATTERNS = [
-  /\.env/i,
-  /\.ssh\/id_/i,
-  /\.ssh\/authorized_keys/i,
-  /\.gnupg/i,
-  /\.aws\//i,
-  /\.config\/gh\/hosts\.yml/i,
-  /netrc/i,
-  /\.npmrc/i,
-  /\.pypirc/i,
-  /passwd/i,
-  /shadow/i,
-  /sudoers/i,
-  /\.git\/config/i,
-  /node_modules\//i,
-  /package-lock\.json$/i,
-  /yarn\.lock$/i,
+/**
+ * Sensitive file paths for write/edit. Each entry is a contiguous sequence of
+ * path segments that must match exactly somewhere in the target path. This
+ * avoids false positives like "my_passwd_helper.ts" matching a /passwd regex.
+ */
+const SENSITIVE_PATH_PATTERNS: Array<{ segments: string[]; reason: string }> = [
+  { segments: [".env"], reason: "Environment file (.env)" },
+  { segments: [".env.local"], reason: "Local environment file" },
+  { segments: [".env.production"], reason: "Production environment file" },
+  { segments: [".env.development"], reason: "Development environment file" },
+  { segments: [".env.test"], reason: "Test environment file" },
+  { segments: [".ssh", "id_rsa"], reason: "SSH private key (RSA)" },
+  { segments: [".ssh", "id_dsa"], reason: "SSH private key (DSA)" },
+  { segments: [".ssh", "id_ecdsa"], reason: "SSH private key (ECDSA)" },
+  { segments: [".ssh", "id_ed25519"], reason: "SSH private key (Ed25519)" },
+  { segments: [".ssh", "authorized_keys"], reason: "SSH authorized_keys" },
+  { segments: [".ssh", "known_hosts"], reason: "SSH known_hosts" },
+  { segments: [".ssh", "config"], reason: "SSH config" },
+  { segments: [".gnupg"], reason: "GnuPG directory" },
+  { segments: [".aws", "credentials"], reason: "AWS credentials" },
+  { segments: [".config", "gh", "hosts.yml"], reason: "GitHub CLI hosts" },
+  { segments: [".netrc"], reason: "netrc credentials" },
+  { segments: [".npmrc"], reason: "npm config" },
+  { segments: [".pypirc"], reason: "PyPI config" },
+  { segments: ["etc", "passwd"], reason: "/etc/passwd" },
+  { segments: ["etc", "shadow"], reason: "/etc/shadow" },
+  { segments: ["etc", "sudoers"], reason: "/etc/sudoers" },
+  { segments: [".git", "config"], reason: "Git repository config" },
 ];
 
+/** File or directory names that are sensitive wherever they appear in the path */
+const SENSITIVE_SEGMENT_NAMES = new Set<string>([
+  "node_modules",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+]);
+
+function pathSegmentsMatch(segments: string[], pattern: string[]): boolean {
+  if (pattern.length > segments.length) return false;
+  for (let start = 0; start <= segments.length - pattern.length; start++) {
+    let ok = true;
+    for (let i = 0; i < pattern.length; i++) {
+      if (segments[start + i] !== pattern[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
 function isSensitivePath(filePath: string): { sensitive: boolean; reason?: string } {
-  const normalized = path.normalize(filePath);
+  let normalized: string;
+  try {
+    normalized = path.resolve(filePath);
+  } catch {
+    return { sensitive: true, reason: "Invalid path" };
+  }
+  const segments = normalized.split(path.sep).filter((s) => s.length > 0);
+
   for (const p of SENSITIVE_PATH_PATTERNS) {
-    if (p.test(normalized)) {
-      return { sensitive: true, reason: `Protected path matched: ${normalized}` };
+    if (pathSegmentsMatch(segments, p.segments)) {
+      return { sensitive: true, reason: p.reason };
+    }
+  }
+  for (const seg of segments) {
+    if (SENSITIVE_SEGMENT_NAMES.has(seg)) {
+      return { sensitive: true, reason: `Protected name: ${seg}` };
     }
   }
   return { sensitive: false };
@@ -384,24 +429,38 @@ function setCacheEntry(key: string, entry: CacheEntry): void {
    Whisper local detection & helpers
    ──────────────────────────────── */
 
-let whisperDetected: boolean | null = null;
+interface WhisperCommand {
+  cmd: string;
+  prefixArgs: string[];
+}
 
-function detectWhisper(): boolean {
-  if (whisperDetected !== null) return whisperDetected;
+let whisperCommandInfo: WhisperCommand | null | undefined = undefined;
+
+/**
+ * Locate the Whisper CLI on this system. Caches the result.
+ * Returns the executable name and any prefix args (e.g. ["-m", "whisper"]
+ * for `python3 -m whisper`). Returns null if Whisper is not installed.
+ */
+function getWhisperCommand(): WhisperCommand | null {
+  if (whisperCommandInfo !== undefined) return whisperCommandInfo;
   try {
     execSync("whisper --help", { stdio: "ignore" });
-    whisperDetected = true;
-    return true;
+    whisperCommandInfo = { cmd: "whisper", prefixArgs: [] };
+    return whisperCommandInfo;
   } catch {
     try {
       execSync("python3 -m whisper --help", { stdio: "ignore" });
-      whisperDetected = true;
-      return true;
+      whisperCommandInfo = { cmd: "python3", prefixArgs: ["-m", "whisper"] };
+      return whisperCommandInfo;
     } catch {
-      whisperDetected = false;
-      return false;
+      whisperCommandInfo = null;
+      return null;
     }
   }
+}
+
+function detectWhisper(): boolean {
+  return getWhisperCommand() !== null;
 }
 
 function detectAudioMimeType(filePath: string): string {
@@ -422,24 +481,53 @@ function detectAudioMimeType(filePath: string): string {
   return map[ext] ?? "audio/wav";
 }
 
+/**
+ * Validate an audio file path: must exist, be a regular file, and contain
+ * no shell metacharacters. Resolves to absolute form. Throws on failure.
+ *
+ * Defence in depth: even though spawn() is called with shell:false below,
+ * we still sanitise the path so that a future refactor cannot regress
+ * into a command-injection vulnerability.
+ */
+function validateAudioFilePath(p: string): string {
+  if (typeof p !== "string" || p.length === 0) {
+    throw new Error("filePath must be a non-empty string");
+  }
+  if (p.length > 4096) {
+    throw new Error(`filePath is too long (${p.length} chars, max 4096)`);
+  }
+  // Reject the most dangerous shell metacharacters. shell:false makes this
+  // strictly belt-and-suspenders, but the cost is low and the safety win
+  // is permanent.
+  if (/[\x00;|`$\n\r&]/.test(p)) {
+    throw new Error(
+      `filePath contains forbidden characters: ${JSON.stringify(p)}`
+    );
+  }
+  const resolved = path.resolve(p);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Audio file not found: ${resolved}`);
+  }
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) {
+    throw new Error(`Not a regular file: ${resolved}`);
+  }
+  return resolved;
+}
+
 async function transcribeWithWhisper(
   filePath: string,
   language?: string,
   model?: string,
   signal?: AbortSignal
 ): Promise<string> {
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`Audio file not found: ${filePath}`);
+  const whisperInfo = getWhisperCommand();
+  if (!whisperInfo) {
+    throw new Error(
+      "Whisper-local is not installed. Install with: pip install openai-whisper"
+    );
   }
-
-  const whisperCmd = (() => {
-    try {
-      execSync("whisper --help", { stdio: "ignore" });
-      return "whisper";
-    } catch {
-      return "python3 -m whisper";
-    }
-  })();
+  const safePath = validateAudioFilePath(filePath);
 
   const lang = language && language !== "auto" ? language : "French";
   const whisperModel = model ?? config.whisperModel ?? "base";
@@ -448,7 +536,8 @@ async function transcribeWithWhisper(
 
   // Whisper writes .txt next to the audio by default; we force --output_dir
   const args = [
-    filePath,
+    ...whisperInfo.prefixArgs,
+    safePath,
     "--model", whisperModel,
     "--language", lang,
     "--output_dir", outDir,
@@ -457,9 +546,12 @@ async function transcribeWithWhisper(
   ];
 
   return new Promise((resolve, reject) => {
-    const proc = spawn(whisperCmd.split(" ")[0], [...whisperCmd.split(" ").slice(1), ...args], {
+    // shell:false is critical: it prevents command injection via filePath
+    // or any other argument. All inputs are passed as discrete argv entries,
+    // never concatenated into a shell string.
+    const proc = spawn(whisperInfo.cmd, args, {
       cwd: EXT_DIR,
-      shell: whisperCmd.includes("python3") ? false : true,
+      shell: false,
     });
 
     let stderr = "";
@@ -507,6 +599,17 @@ async function transcribeWithAzure(
   }
   if (!fs.existsSync(filePath)) {
     throw new Error(`Audio file not found: ${filePath}`);
+  }
+  // Azure Speech conversation API caps payload around 25 MB. Reject larger
+  // files up-front to avoid OOM on fs.readFileSync and a 413 from the API.
+  const MAX_AZURE_AUDIO_BYTES = 25 * 1024 * 1024;
+  const stat = fs.statSync(filePath);
+  if (stat.size > MAX_AZURE_AUDIO_BYTES) {
+    throw new Error(
+      `Audio file too large for Azure Speech: ${(stat.size / 1024 / 1024).toFixed(1)} MB ` +
+        `(max ${(MAX_AZURE_AUDIO_BYTES / 1024 / 1024).toFixed(0)} MB). ` +
+        `Use a smaller file or transcribe with whisper-local.`
+    );
   }
 
   const mime = detectAudioMimeType(filePath);

@@ -7,7 +7,9 @@ Extension **Pi Coding Agent** qui fournit 4 outils pour l'agent :
 - **`web_render`** — rendu dynamique avec Playwright pour les SPA JS-heavy
 - **`speech_to_text`** — transcription vocale (Whisper local gratuit ou Azure Speech cloud)
 
-Avec système de **cache local**, **configuration persistante**, et **guidelines prompt** pour guider l'agent dans le choix des outils.
+Avec système de **cache local**, **configuration persistante**, **wizard de confirmation pour les actions sensibles** (commandes `bash` destructives, écriture de fichiers protégés) et **guidelines prompt** pour guider l'agent dans le choix des outils.
+
+> **Note technique** — au premier chargement, l'extension patche automatiquement `node_modules/@earendil-works/pi-ai/dist/api/anthropic-messages.js` pour corriger un bug de `convertTools()` quand un outil n'a pas de schéma de paramètres (le `tool.parameters` est `undefined`). Le patch est idempotent : il ne se ré-applique que si la ligne bugguée est détectée, donc il survit aux mises à jour de pi-ai. Vous verrez un message `[thetis-tool] Patched pi-ai anthropic-messages.js` dans les logs au premier chargement de session.
 
 ## Installation
 
@@ -130,6 +132,10 @@ Transcription vocale multi-provider. Auto-détecte le meilleur provider disponib
 2. Sinon teste si Azure est configuré → fallback Azure
 3. Sinon erreur explicative avec instructions d'installation
 
+**Limites :**
+- **Azure Speech** : taille max **25 MB** par fichier. Au-delà, l'appel est refusé pour éviter un OOM sur `fs.readFileSync` et un 413 côté API. Utilisez `whisper-local` pour les fichiers plus gros.
+- **Whisper** écrit sa sortie temporaire dans `~/.pi/agent/extensions/thetis-tool/whisper_out/` puis la supprime après lecture.
+
 **Guidelines prompt :**
 - Utiliser `speech_to_text` quand l'utilisateur fournit ou mentionne un fichier audio à transcrire
 - WhatsApp envoie des `.ogg`, Discord des `.mp3`/`.wav`/`.webm`
@@ -180,6 +186,69 @@ Wizard interactif de configuration complète :
 - **Provider STT** (`auto` / `whisper-local` / `azure`)
 - **Modèle Whisper** (`tiny` / `base` / `small` / `medium` / `large` / `turbo`)
 
+### `/thetis confirm`
+
+Active ou désactive globalement le **wizard de confirmation** pour les actions sensibles (voir la section *Sécurité* ci-dessous). Affiche l'état courant et bascule.
+
+```bash
+/thetis confirm
+# → Confirmations d'actions sensibles : activées.
+/thetis confirm
+# → Confirmations d'actions sensibles : désactivées.
+```
+
+L'état est persisté dans `~/.pi/agent/extensions/thetis-tool/confirm.json`.
+
+## Sécurité : confirmation des actions sensibles
+
+L'extension intercepte les appels aux outils natifs de pi (`bash`, `write`, `edit`) et exige une **confirmation explicite via un wizard** avant d'exécuter toute action jugée risquée. Les outils Thetis (`web_scrape`, `web_search`, `web_render`, `speech_to_text`) ne sont **pas** soumis à confirmation : ce sont des appels réseau ou de l'API sans effet destructif local.
+
+### Commandes `bash` détectées
+
+| Pattern | Raison |
+|---|---|
+| `rm -r/-f/--recursive` | Suppression récursive |
+| `dd` | Écriture disque bas niveau |
+| `mkfs.*` | Formatage de filesystem |
+| `sudo` | Élévation de privilèges |
+| `chmod 777` | Permissions dangereuses |
+| `chown root` | Escalade de privilèges |
+| `> /dev/sd*` / `> /dev/nvme*` / `> /dev/hd*` / `> /dev/mmcblk*` | Écrasement disque |
+| `curl … \| sh/bash/zsh` | Exécution à distance (RCE) |
+| `wget … \| sh/bash/zsh` | Exécution à distance (RCE) |
+| `mv … /dev/null` | Destruction de fichier |
+
+> **Limite connue** : cette détection est une *blacklist* regex. Des contournements existent (encodage base64, `${IFS}`, redirections imbriquées…). Le wizard est une couche de sécurité, pas un sandbox.
+
+### Chemins protégés (`write` / `edit`)
+
+La détection repose sur les **segments de chemin** (correspondance exacte, pas de regex trop large) : un fichier `passwordHelper.ts` ne déclenchera pas de faux positif.
+
+- Environnements : `~/.env`, `~/.env.local`, `~/.env.production`, `~/.env.development`, `~/.env.test`
+- SSH : `~/.ssh/id_rsa`, `~/.ssh/id_dsa`, `~/.ssh/id_ecdsa`, `~/.ssh/id_ed25519`, `~/.ssh/authorized_keys`, `~/.ssh/known_hosts`, `~/.ssh/config`
+- Clés & secrets : `~/.gnupg/`, `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`
+- Système : `/etc/passwd`, `/etc/shadow`, `/etc/sudoers`
+- Repo : `~/.git/config`
+- Dépendances : `node_modules/`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`
+
+### Comportement du wizard
+
+- **Mode TUI** : overlay riche affichant l'outil, la raison (`Recursive file deletion (rm)` par ex.), la commande ou le chemin complet, et deux boutons **Accepter** / **Refuser`.
+- **Mode RPC / Gateway (Discord, WhatsApp…)** : un `ctx.ui.confirm()` est envoyé au client distant.
+- **Mode headless (pas d'UI)** : l'action est **bloquée par défaut** pour éviter toute exécution silencieuse. Désactivez le wizard via `/thetis confirm` si vous souhaitez malgré tout exécuter en headless.
+
+### Fichier `confirm.json`
+
+Stocké dans `~/.pi/agent/extensions/thetis-tool/confirm.json` :
+
+```json
+{
+  "enabled": true
+}
+```
+
+`true` = confirmation demandée (défaut). `false` = le wizard est désactivé et les actions sensibles passent sans demande.
+
 ## Configuration
 
 Fichier `~/.pi/agent/extensions/thetis-tool/config.json` :
@@ -196,10 +265,17 @@ Fichier `~/.pi/agent/extensions/thetis-tool/config.json` :
 }
 ```
 
-Variables d'environnement :
-- `SERPAPI_KEY` — clé API SerpAPI (prioritaire sur le fichier de config)
-- `AZURE_SPEECH_KEY` — clé Azure Speech (prioritaire sur le fichier)
-- `AZURE_SPEECH_REGION` — région Azure (prioritaire sur le fichier)
+Variables d'environnement (utilisées comme **fallback** quand la clé correspondante n'est pas définie dans `config.json` — la priorité est : `config.json` > variable d'environnement) :
+- `SERPAPI_KEY` — clé API SerpAPI
+- `AZURE_SPEECH_KEY` — clé Azure Speech
+- `AZURE_SPEECH_REGION` — région Azure
+
+> ⚠️ **Sécurité** — `config.json` et `confirm.json` contiennent des clés API en clair (SerpAPI, Azure Speech). Restreignez les permissions après création :
+> ```bash
+> chmod 600 ~/.pi/agent/extensions/thetis-tool/config.json
+> chmod 600 ~/.pi/agent/extensions/thetis-tool/confirm.json
+> ```
+> Les deux fichiers sont déjà dans `.gitignore` pour ne pas être commités par accident.
 
 ## Stack
 
@@ -243,6 +319,10 @@ thetis-tool/
 ├── package.json     # Dépendances + manifest pi-package
 ├── package-lock.json
 ├── README.md        # Documentation
+├── config.json      # Créé par /thetis config (gitignoré, contient des secrets)
+├── confirm.json     # État du wizard de confirmation (gitignoré)
+├── cache/           # Cache local des scrapes (gitignoré)
+├── whisper_out/     # Sortie temporaire de Whisper (gitignoré, auto-nettoyé)
 └── .gitignore
 ```
 
