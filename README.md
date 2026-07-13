@@ -208,6 +208,19 @@ Active ou désactive globalement le **wizard de confirmation** pour les actions 
 
 L'état est persisté dans `~/.pi/agent/extensions/thetis-tool/confirm.json`.
 
+### `/thetis auto-tools`
+
+Active ou désactive l'**activation automatique des outils Thetis** au démarrage de session. Quand elle est activée, les outils `web_scrape`, `web_search`, `web_render` et `speech_to_text` sont immédiatement disponibles pour l'agent.
+
+```bash
+/thetis auto-tools
+# → Activation automatique des outils Thetis : activée.
+/thetis auto-tools
+# → Activation automatique des outils Thetis : désactivée.
+```
+
+L'état est persisté dans `~/.pi/agent/extensions/thetis-tool/config.json` sous la clé `autoEnableTools`.
+
 ## Sécurité : confirmation des actions sensibles
 
 L'extension intercepte les appels aux outils natifs de pi (`bash`, `write`, `edit`) et exige une **confirmation explicite via un wizard** avant d'exécuter toute action jugée risquée. Les outils Thetis (`web_scrape`, `web_search`, `web_render`, `speech_to_text`) ne sont **pas** soumis à confirmation : ce sont des appels réseau ou de l'API sans effet destructif local.
@@ -258,6 +271,22 @@ Stocké dans `~/.pi/agent/extensions/thetis-tool/confirm.json` :
 
 `true` = confirmation demandée (défaut). `false` = le wizard est désactivé et les actions sensibles passent sans demande.
 
+## Auto-activation des outils
+
+Par défaut, Thetis active automatiquement ses 4 outils (`web_scrape`, `web_search`, `web_render`, `speech_to_text`) au démarrage de chaque session Pi. Cela permet à l'agent de les utiliser de manière proactive sans action manuelle de l'utilisateur.
+
+Le comportement est contrôlé par la clé `autoEnableTools` dans `config.json` :
+- `true` ou absent → outils activés automatiquement (défaut)
+- `false` → outils désactivés au démarrage ; l'utilisateur les active lui-même via l'interface Pi
+
+Pour basculer rapidement sans éditer le fichier :
+
+```bash
+/thetis auto-tools
+```
+
+L'extension injecte également une directive dans le system prompt de chaque tour pour renforcer l'usage proactif des outils Thetis (recherche web, scraping, transcription audio) quand ils sont actifs.
+
 ## Configuration
 
 Fichier `~/.pi/agent/extensions/thetis-tool/config.json` :
@@ -270,7 +299,8 @@ Fichier `~/.pi/agent/extensions/thetis-tool/config.json` :
   "azureSpeechKey": "...",
   "azureSpeechRegion": "westeurope",
   "sttProvider": "auto",
-  "whisperModel": "base"
+  "whisperModel": "base",
+  "autoEnableTools": true
 }
 ```
 

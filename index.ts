@@ -107,6 +107,7 @@ interface ThetisConfig {
   azureSpeechRegion?: string;
   sttProvider?: "auto" | "whisper-local" | "azure";
   whisperModel?: "tiny" | "base" | "small" | "medium" | "large" | "turbo";
+  autoEnableTools?: boolean;
 }
 
 /* ────────────────────────────────
@@ -1160,15 +1161,48 @@ async function webSearchDuckDuckGo(
    Extension factory
    ──────────────────────────────── */
 
+const THETIS_TOOLS = [
+  "web_scrape",
+  "web_search",
+  "web_render",
+  "speech_to_text",
+];
+
 export default function thetisToolExtension(pi: ExtensionAPI) {
+  function hasThetisToolsActive(): boolean {
+    const active = pi.getActiveTools();
+    return THETIS_TOOLS.some((t) => active.includes(t));
+  }
+
   // Apply pi-ai compatibility patch on extension load.
   patchPiAiAnthropicMessages();
 
-  // Purge stale cache on every session start
+  // Purge stale cache on every session start and auto-enable Thetis tools
   pi.on("session_start", async () => {
     config = loadConfig();
     confirmConfig = loadConfirmConfig();
     purgeStaleCache();
+
+    if (config.autoEnableTools !== false) {
+      const active = pi.getActiveTools();
+      pi.setActiveTools([...new Set([...active, ...THETIS_TOOLS])]);
+    }
+  });
+
+  // Reinforce proactive usage of Thetis tools in the system prompt
+  pi.on("before_agent_start", async (event) => {
+    if (!hasThetisToolsActive()) return;
+
+    return {
+      systemPrompt:
+        event.systemPrompt +
+        "\n\n## Thetis tools habit\n" +
+        "You have access to the Thetis web and speech tools. " +
+        "Use web_search proactively when the user asks for current information, news, facts, or sources without providing a specific URL. " +
+        "Use web_scrape when the user provides or mentions a specific URL to analyze. " +
+        "Use web_render when web_scrape with renderJs=true still fails or when precise control over waiting is needed. " +
+        "Use speech_to_text when the user provides or mentions an audio file to transcribe.",
+    };
   });
 
   /* ─── Permission gate for sensitive actions ─── */
@@ -1519,6 +1553,27 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (sub === "auto-tools" || sub === "autoenabletools" || sub === "auto-enable-tools") {
+        const next = config.autoEnableTools !== false ? false : true;
+        const newCfg: ThetisConfig = {
+          ...config,
+          autoEnableTools: next,
+        };
+        saveConfig(newCfg);
+        config = newCfg;
+
+        if (next) {
+          const active = pi.getActiveTools();
+          pi.setActiveTools([...new Set([...active, ...THETIS_TOOLS])]);
+        }
+
+        ctx.ui.notify(
+          `Activation automatique des outils Thetis : ${next ? "activée" : "désactivée"}.`,
+          "info"
+        );
+        return;
+      }
+
       if (sub === "azure-key") {
         const key = parts[1];
         if (!key) {
@@ -1572,6 +1627,10 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
           `Whisper model [${config.whisperModel ?? "base"}] (tiny / base / small / medium / large / turbo):`,
           config.whisperModel ?? "base"
         );
+        const autoToolsRaw = await ctx.ui.input(
+          `Auto-enable Thetis tools on session start [${config.autoEnableTools !== false ? "true" : "false"}] (true / false):`,
+          config.autoEnableTools !== false ? "true" : "false"
+        );
 
         const newCfg: ThetisConfig = {
           ...config,
@@ -1582,6 +1641,7 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
           azureSpeechRegion: azureRegion.trim() || undefined,
           sttProvider: (sttProvider.trim() as ThetisConfig["sttProvider"]) || "auto",
           whisperModel: (whisperModel.trim() as ThetisConfig["whisperModel"]) || "base",
+          autoEnableTools: autoToolsRaw.trim().toLowerCase() !== "false",
         };
         saveConfig(newCfg);
         config = newCfg;
@@ -1609,8 +1669,9 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
         `Max length : ${config.maxScrapeLength ?? 15000} chars`,
         ``,
         `Tools registered : web_scrape, web_search, web_render, speech_to_text`,
+        `Auto-enable Thetis tools : ${config.autoEnableTools !== false ? "✅ activée" : "❌ désactivée"} (/thetis auto-tools)`,
         `Confirmations sensibles (bash/write/edit) : ${confirmConfig.enabled ? "✅ activées" : "❌ désactivées"} (/thetis confirm)`,
-        `Commands : /thetis status, /thetis clear-cache, /thetis config, /thetis azure-key, /thetis confirm`,
+        `Commands : /thetis status, /thetis clear-cache, /thetis config, /thetis azure-key, /thetis confirm, /thetis auto-tools`,
       ].join("\n");
 
       ctx.ui.notify(statusText, "info");
