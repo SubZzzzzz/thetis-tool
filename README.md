@@ -33,6 +33,12 @@ cd ~/.pi/agent/extensions/thetis-tool
 npm install
 ```
 
+## Mise à jour
+
+```bash
+pi update --extension git:github.com/SubZzzzzz/thetis-tool
+```
+
 ## Outils
 
 ### `web_scrape`
