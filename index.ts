@@ -1328,7 +1328,7 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use web_search when the user asks for current information, news, facts, or sources without providing a specific URL.",
       "Limit yourself to ONE web_search call per user request. Do not run multiple searches in a row; scrape the URLs from the first result set instead.",
-      "Follow up with web_scrape to read the full content of the most relevant result(s).","
+      "Follow up with web_scrape to read the full content of the most relevant result(s).",
       "Default engine is DuckDuckGo (free). For Google/Yahoo/Yandex, configure a SerpAPI key via /thetis config or the SERPAPI_KEY env variable.",
     ],
     parameters: Type.Object({
