@@ -51,10 +51,10 @@ Extraction de contenu depuis une URL. Mode statique par défaut (rapide). Mode d
 
 **Modes d'extraction :**
 
-- **`html`** — retourne le DOM complet (défaut pour les LLM)
+- **`html`** — retourne le DOM nettoyé (scripts, styles, navigation, pubs et SVG retirés automatiquement) (défaut pour les LLM)
 - **`text`** — texte brut sans balises
 - **`markdown`** — conversion HTML → Markdown via Turndown
-- **`links`** — liste des liens trouvés (`- [texte](url)`)
+- **`links`** — liste des liens trouvés avec URLs relatives résolues en absolu (`- [texte](url)`)
 - **`readability`** — extraction d'article propre via @mozilla/readability (idéal pour blogs et docs)
 
 **Guidelines prompt :**
@@ -64,6 +64,7 @@ Extraction de contenu depuis une URL. Mode statique par défaut (rapide). Mode d
 - Utiliser `extract='links'` pour découvrir les URLs sortantes
 - Ne mettre `renderJs=true` que si la page est une SPA connue et que le fetch statique est vide
 - Respecter `maxLength` pour éviter l'overflow de contexte
+- Les URLs GitHub `/blob/` sont automatiquement réécrites en `raw.githubusercontent.com` pour obtenir du texte brut sans l'interface lourde de GitHub
 
 ### `web_search`
 
@@ -79,6 +80,7 @@ Recherche web. Retourne titres, URLs et snippets. Par défaut, tente DuckDuckGo 
 
 **Guidelines prompt :**
 - Utiliser `web_search` quand l'utilisateur demande des informations actuelles, news, faits ou sources sans fournir d'URL
+- Limiter à **une seule** recherche par requête utilisateur ; ne pas enchaîner plusieurs `web_search`, scraper plutôt les URLs du premier résultat
 - Suivre avec `web_scrape` pour lire le contenu complet des résultats les plus pertinents
 - Par défaut, utilise DuckDuckGo (gratuit) avec Bing en fallback automatique si bloqué. Pour Google/Yahoo/Yandex, configurer une clé SerpAPI via `/thetis config` ou `SERPAPI_KEY`
 
@@ -100,6 +102,7 @@ Rendu dynamique avec Playwright pour les pages JS-heavy. Fallback quand `web_scr
 - Utiliser `web_render` quand `web_scrape` avec `renderJs=true` échoue ou quand un contrôle précis sur l'attente est nécessaire
 - Nécessite Playwright installé (`npm install playwright` dans le dossier de l'extension)
 - Retourne `html` par défaut pour la consommation LLM ; utiliser `markdown` pour du texte simplifié
+- Les URLs GitHub `/blob/` sont automatiquement réécrites en `raw.githubusercontent.com`
 
 ### `speech_to_text`
 
@@ -146,7 +149,7 @@ Transcription vocale multi-provider. Auto-détecte le meilleur provider disponib
 
 Un cache local est activé par défaut (TTL : 60 minutes) pour les outils web uniquement :
 
-- Clés basées sur `url + extract + selector + renderJs`
+- Clés basées sur `url + extract + selector + renderJs` (les URLs GitHub réécrites en raw ont leur propre entrée)
 - Réduction des appels réseau répétés
 - Purge automatique des entrées expirées au démarrage de session
 - Cache stocké dans `~/.pi/agent/extensions/thetis-tool/cache/`

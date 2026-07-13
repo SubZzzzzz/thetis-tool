@@ -772,6 +772,23 @@ function checkSignal(signal?: AbortSignal) {
   }
 }
 
+/**
+ * Rewrite a github.com /blob/ URL to raw.githubusercontent.com
+ * so we fetch plain text instead of the heavy HTML UI.
+ */
+function resolveGitHubRawUrl(url: string): string | null {
+  try {
+    const u = new URL(url);
+    if (u.hostname !== "github.com" && u.hostname !== "www.github.com") return null;
+    const match = u.pathname.match(/^\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/);
+    if (!match) return null;
+    const [, owner, repo, branch, filePath] = match;
+    return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
+  } catch {
+    return null;
+  }
+}
+
 /* ────────────────────────────────
    Static scraping
    ──────────────────────────────── */
@@ -802,7 +819,8 @@ async function fetchHtml(url: string, signal?: AbortSignal): Promise<string> {
 function scrapeWithCheerio(
   html: string,
   selector: string | undefined,
-  extract: "text" | "markdown" | "html" | "links" | "readability"
+  extract: "text" | "markdown" | "html" | "links" | "readability",
+  baseUrl?: string
 ): string {
   const { load } = require("cheerio");
   const $ = load(html);
@@ -813,12 +831,11 @@ function scrapeWithCheerio(
       const href = $(el).attr("href");
       const text = $(el).text().trim();
       if (href) {
+        let absolute = href;
         try {
-          const absolute = new URL(href, "https://example.com").href; // base will be replaced by caller if needed
-          // We don't have the real base here easily, so we'll keep raw href
-          // Actually caller can resolve later.
+          absolute = new URL(href, baseUrl ?? "https://example.com").href;
         } catch {}
-        links.push(`- [${text || href}](${href})`);
+        links.push(`- [${text || href}](${absolute})`);
       }
     });
     return links.join("\n") || "No links found.";
@@ -830,6 +847,10 @@ function scrapeWithCheerio(
   }
 
   if (extract === "html") {
+    // Strip noisy elements before sending HTML to the LLM
+    $(
+      "script, style, nav, header, footer, aside, svg, link[rel='stylesheet'], noscript, iframe, [class*='cookie'], [id*='cookie'], [class*='advertisement'], [class*='ads']"
+    ).remove();
     return root.html() ?? "";
   }
   if (extract === "text") {
@@ -875,7 +896,7 @@ async function scrapeStatic(
   if (extract === "readability") {
     return scrapeWithReadability(html);
   }
-  return scrapeWithCheerio(html, selector, extract);
+  return scrapeWithCheerio(html, selector, extract, url);
 }
 
 /* ────────────────────────────────
@@ -934,7 +955,14 @@ async function scrapeDynamic(
     checkSignal(signal);
 
     // Re-use cheerio/turndown on the rendered HTML
-    if (extract === "html") return rawHtml;
+    if (extract === "html") {
+      const { load } = require("cheerio");
+      const $ = load(rawHtml);
+      $(
+        "script, style, nav, header, footer, aside, svg, link[rel='stylesheet'], noscript, iframe, [class*='cookie'], [id*='cookie'], [class*='advertisement'], [class*='ads']"
+      ).remove();
+      return $.html();
+    }
     const { load } = require("cheerio");
     const $ = load(rawHtml);
     const root = selector ? $(selector) : $("body");
@@ -1208,43 +1236,58 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal) {
       const extract = params.extract ?? "html";
       const maxLen = params.maxLength ?? config.maxScrapeLength ?? 15000;
-      const key = cacheKey(params.url, extract, params.selector, params.renderJs);
+
+      // Automatically rewrite GitHub blob URLs to raw text for non-readability modes
+      let targetUrl = params.url;
+      let urlRewritten = false;
+      if (extract !== "readability" && extract !== "links") {
+        const raw = resolveGitHubRawUrl(params.url);
+        if (raw) {
+          targetUrl = raw;
+          urlRewritten = true;
+        }
+      }
+      const useRenderJs = params.renderJs && !urlRewritten;
+
+      const key = cacheKey(targetUrl, extract, params.selector, useRenderJs);
       const cached = getCacheEntry(key);
       if (cached) {
         return {
           content: [
             { type: "text", text: truncate(cached.content, maxLen) },
           ],
-          details: { cached: true, url: params.url, extract },
+          details: { cached: true, url: targetUrl, extract, urlRewritten },
         };
       }
 
       let content: string;
-      if (params.renderJs) {
-        content = await scrapeDynamic(
-          params.url,
-          params.selector,
-          undefined,
-          extract === "links" || extract === "readability"
-            ? "text"
-            : (extract as "text" | "markdown" | "html"),
-          signal
-        );
-        if (extract === "readability") {
-          // After dynamic render, try readability on the fully rendered HTML
-          const { load } = require("cheerio");
-          const $ = load(content); // scrapeDynamic returns text or markdown; not raw HTML here.
-          // Actually, dynamic returns text/markdown/html. For readability we need raw HTML.
-          // Let's do a dedicated dynamic render that returns raw HTML, then readability.
-          content = await scrapeDynamic(params.url, params.selector, undefined, "html", signal);
-          content = scrapeWithReadability(content);
-        } else if (extract === "links") {
-          content = await scrapeDynamic(params.url, params.selector, undefined, "html", signal);
-          content = scrapeWithCheerio(content, params.selector, "links");
+      if (useRenderJs) {
+        if (extract === "readability" || extract === "links") {
+          // Single dynamic render in raw HTML, then post-process
+          const rawHtml = await scrapeDynamic(
+            targetUrl,
+            params.selector,
+            undefined,
+            "html",
+            signal
+          );
+          if (extract === "readability") {
+            content = scrapeWithReadability(rawHtml);
+          } else {
+            content = scrapeWithCheerio(rawHtml, params.selector, "links", targetUrl);
+          }
+        } else {
+          content = await scrapeDynamic(
+            targetUrl,
+            params.selector,
+            undefined,
+            extract as "text" | "markdown" | "html",
+            signal
+          );
         }
       } else {
         content = await scrapeStatic(
-          params.url,
+          targetUrl,
           params.selector,
           extract,
           signal
@@ -1252,10 +1295,10 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
       }
 
       setCacheEntry(key, {
-        url: params.url,
+        url: targetUrl,
         extract,
         selector: params.selector,
-        renderJs: params.renderJs,
+        renderJs: useRenderJs,
         content,
         timestamp: Date.now(),
       });
@@ -1263,10 +1306,11 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: truncate(content, maxLen) }],
         details: {
-          url: params.url,
+          url: targetUrl,
           extract,
           selector: params.selector,
-          renderJs: params.renderJs,
+          renderJs: useRenderJs,
+          urlRewritten,
           length: content.length,
         },
       };
@@ -1283,7 +1327,8 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
       "Search the web for URLs and snippets on a topic",
     promptGuidelines: [
       "Use web_search when the user asks for current information, news, facts, or sources without providing a specific URL.",
-      "Follow up with web_scrape to read the full content of the most relevant result(s).",
+      "Limit yourself to ONE web_search call per user request. Do not run multiple searches in a row; scrape the URLs from the first result set instead.",
+      "Follow up with web_scrape to read the full content of the most relevant result(s).","
       "Default engine is DuckDuckGo (free). For Google/Yahoo/Yandex, configure a SerpAPI key via /thetis config or the SERPAPI_KEY env variable.",
     ],
     parameters: Type.Object({
@@ -1366,8 +1411,14 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal) {
       const maxLen = params.maxLength ?? config.maxScrapeLength ?? 15000;
       const extract = params.extract ?? "html";
+      let targetUrl = params.url;
+      const raw = resolveGitHubRawUrl(params.url);
+      if (raw) {
+        targetUrl = raw;
+      }
+
       const content = await scrapeDynamic(
-        params.url,
+        targetUrl,
         params.selector,
         params.waitFor,
         extract,
@@ -1375,7 +1426,7 @@ export default function thetisToolExtension(pi: ExtensionAPI) {
       );
       return {
         content: [{ type: "text", text: truncate(content, maxLen) }],
-        details: { url: params.url, selector: params.selector, waitFor: params.waitFor, extract },
+        details: { url: targetUrl, originalUrl: params.url, selector: params.selector, waitFor: params.waitFor, extract },
       };
     },
   });
