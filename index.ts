@@ -1,13 +1,13 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  ExtensionCommandContext,
+import {
+  DynamicBorder,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   Container,
-  DynamicBorder,
   SelectList,
   Spacer,
   Text,
@@ -339,16 +339,33 @@ async function confirmActionWizard(
     return result === "accept";
   }
 
-  // Mode RPC / Gateway : select/confirm relayé au client distant
+  // Mode RPC / Gateway : utiliser le mécanisme interactif du gateway s'il est présent
   const title = `⚠️ ${toolName} — ${reason}`;
-  const body = details.length > 0 ? details.join("\n") : undefined;
+  const body = details.length > 0 ? details.join("\n") : "Action sensible détectée.";
 
-  // confirm() est supporté en RPC ; select() aussi
-  const ok = await ctx.ui.confirm(
-    title,
-    body ?? "Action sensible détectée. Autoriser l'exécution ?"
+  const gatewayConfirm = (globalThis as any).__gatewayConfirm;
+  if (typeof gatewayConfirm === "function") {
+    // thetis-gateway expose cette fonction pour afficher des boutons Discord /
+    // un menu WhatsApp. Elle retourne null s'il n'y a pas de thread actif
+    // (on continue vers le select RPC standard), true si l'utilisateur a
+    // accepté, false s'il a refusé ou si le délai est dépassé.
+    const question = [title, body].join("\n");
+    try {
+      const result = await gatewayConfirm(question);
+      if (result === true) return true;
+      if (result === false) return false;
+    } catch {
+      // Gateway indisponible — fallback select RPC.
+    }
+  }
+
+  const fullTitle = [title, "", body].join("\n");
+  const choice = await ctx.ui.select(
+    fullTitle,
+    ["✅ Accepter", "❌ Refuser"],
+    { timeout: 60000 }
   );
-  return ok;
+  return choice === "✅ Accepter";
 }
 
 function loadConfig(): ThetisConfig {
