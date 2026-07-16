@@ -95,7 +95,7 @@ function patchPiAiAnthropicMessages(): void {
    Paths & Config
    ──────────────────────────────── */
 
-const EXT_DIR = path.join(homedir(), ".pi", "agent", "extensions", "thetis-tool");
+const EXT_DIR = path.join(__dirname);
 const CACHE_DIR = path.join(EXT_DIR, "cache");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
 
@@ -934,7 +934,7 @@ async function scrapeDynamic(
     playwright = await import("playwright");
   } catch {
     throw new Error(
-      "Playwright is not installed. To enable JS rendering, run:\n  cd ~/.pi/agent/extensions/thetis-tool && npm install playwright\nThen reload with /reload."
+      `Playwright is not installed. To enable JS rendering, run:\n  cd ${EXT_DIR} && npm install playwright\nThen reload with /reload.`
     );
   }
   checkSignal(signal);

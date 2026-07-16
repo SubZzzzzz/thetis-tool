@@ -28,8 +28,8 @@ pi -e git:github.com/SubZzzzzz/thetis-tool
 ### Manuelle
 
 ```bash
-git clone https://github.com/SubZzzzzz/thetis-tool.git ~/.pi/agent/extensions/thetis-tool
-cd ~/.pi/agent/extensions/thetis-tool
+git clone https://github.com/SubZzzzzz/thetis-tool.git ~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool
+cd ~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool
 npm install
 ```
 
@@ -143,7 +143,7 @@ Transcription vocale multi-provider. Auto-détecte le meilleur provider disponib
 
 **Limites :**
 - **Azure Speech** : taille max **25 MB** par fichier. Au-delà, l'appel est refusé pour éviter un OOM sur `fs.readFileSync` et un 413 côté API. Utilisez `whisper-local` pour les fichiers plus gros.
-- **Whisper** écrit sa sortie temporaire dans `~/.pi/agent/extensions/thetis-tool/whisper_out/` puis la supprime après lecture.
+- **Whisper** écrit sa sortie temporaire dans `~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/whisper_out/` puis la supprime après lecture.
 
 **Guidelines prompt :**
 - Utiliser `speech_to_text` quand l'utilisateur fournit ou mentionne un fichier audio à transcrire
@@ -158,7 +158,7 @@ Un cache local est activé par défaut (TTL : 60 minutes) pour les outils web un
 - Clés basées sur `url + extract + selector + renderJs` (les URLs GitHub réécrites en raw ont leur propre entrée)
 - Réduction des appels réseau répétés
 - Purge automatique des entrées expirées au démarrage de session
-- Cache stocké dans `~/.pi/agent/extensions/thetis-tool/cache/`
+- Cache stocké dans `~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/cache/`
 
 ## Commandes
 
@@ -206,7 +206,7 @@ Active ou désactive globalement le **wizard de confirmation** pour les actions 
 # → Confirmations d'actions sensibles : désactivées.
 ```
 
-L'état est persisté dans `~/.pi/agent/extensions/thetis-tool/confirm.json`.
+L'état est persisté dans `~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/confirm.json`.
 
 ### `/thetis auto-tools`
 
@@ -219,7 +219,7 @@ Active ou désactive l'**activation automatique des outils Thetis** au démarrag
 # → Activation automatique des outils Thetis : désactivée.
 ```
 
-L'état est persisté dans `~/.pi/agent/extensions/thetis-tool/config.json` sous la clé `autoEnableTools`.
+L'état est persisté dans `~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/config.json` sous la clé `autoEnableTools`.
 
 ## Sécurité : confirmation des actions sensibles
 
@@ -261,7 +261,7 @@ La détection repose sur les **segments de chemin** (correspondance exacte, pas 
 
 ### Fichier `confirm.json`
 
-Stocké dans `~/.pi/agent/extensions/thetis-tool/confirm.json` :
+Stocké dans `~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/confirm.json` :
 
 ```json
 {
@@ -289,7 +289,7 @@ L'extension injecte également une directive dans le system prompt de chaque tou
 
 ## Configuration
 
-Fichier `~/.pi/agent/extensions/thetis-tool/config.json` :
+Fichier `~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/config.json` :
 
 ```json
 {
@@ -311,8 +311,8 @@ Variables d'environnement (utilisées comme **fallback** quand la clé correspon
 
 > ⚠️ **Sécurité** — `config.json` et `confirm.json` contiennent des clés API en clair (SerpAPI, Azure Speech). Restreignez les permissions après création :
 > ```bash
-> chmod 600 ~/.pi/agent/extensions/thetis-tool/config.json
-> chmod 600 ~/.pi/agent/extensions/thetis-tool/confirm.json
+> chmod 600 ~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/config.json
+> chmod 600 ~/.pi/agent/git/github.com/SubZzzzzz/thetis-tool/confirm.json
 > ```
 > Les deux fichiers sont déjà dans `.gitignore` pour ne pas être commités par accident.
 
